@@ -2,6 +2,8 @@
 
 A lightweight, pure assembly text editor for Linux x86_64.
 
+Vibe coded with Claude 4.5 Opus & Gemini 3 Pro High+Fast via Google Antigravity.
+
 ## Features
 - **No Dependencies**: Uses direct Linux system calls (no libc).
 - **Basic Editing**: Insert, Backspace, Left/Right Navigation.
