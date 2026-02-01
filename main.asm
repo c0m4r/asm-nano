@@ -3,6 +3,16 @@ section .data
     clear_screen    db 27, '[', '2', 'J', 27, '[', 'H', 0
     clear_len       equ $ - clear_screen
     
+    status_bar_fmt  db 27, '[', '7', 'm', 0 ; Invert colors
+    status_reset    db 27, '[', 'm', 0      ; Reset colors
+    
+    label_untitled  db "[No Name]", 0
+    label_modified  db " (modified)", 0
+    label_saved     db " [Saved]", 0
+    label_line      db " Line: ", 0
+    
+    legend_msg      db " ^S = Save | ^Q = Quit", 0
+    
     ; Constants
     STDIN           equ 0
     STDOUT          equ 1
@@ -14,7 +24,7 @@ section .data
     SYS_CLOSE       equ 3
     SYS_IOCTL       equ 16
     SYS_EXIT        equ 60
-
+    
     ; File flags
     O_RDWR          equ 2
     O_CREAT         equ 64
@@ -23,6 +33,7 @@ section .data
     ; Termios
     TCGETS          equ 0x5401
     TCSETS          equ 0x5402
+    TIOCGWINSZ      equ 0x5413
     
     ICANON          equ 0000002q
     ECHO            equ 0000010q
@@ -44,15 +55,24 @@ section .bss
     orig_termios    resb 60
     raw_termios     resb 60
     input_char      resb 1
-    seq_buf         resb 3  ; For escape sequences
+    seq_buf         resb 3
+    
+    winsize:
+        ws_row      resw 1
+        ws_col      resw 1
+        ws_xpixel   resw 1
+        ws_ypixel   resw 1
     
     file_buf        resb MAX_BUF_SIZE
     file_len        resq 1
     file_path       resq 1
+    is_dirty        resb 1
     
-    cursor_idx      resq 1  ; Index in file_buf
+    cursor_idx      resq 1
+    actual_row      resq 1
+    actual_col      resq 1
     
-    render_buf      resb 32 ; Buffer for rendering cursor pos escape codes
+    render_buf      resb 64
 
 section .text
     global _start
@@ -64,13 +84,12 @@ _start:
     
     mov rsi, [rsp + 16] ; argv[1]
     mov [file_path], rsi
-    mov rsi, [rsp + 16] ; argv[1]
-    mov [file_path], rsi
     call file_open
 
 .no_file_arg:
-    cld             ; Ensure direction flag is forward
+    cld
     call enable_raw_mode
+    call update_window_size
     call editor_refresh_screen
 
 main_loop:
@@ -84,11 +103,23 @@ main_loop:
     jle .end_loop
 
     call editor_process_keypress
+    call update_window_size
     call editor_refresh_screen
     jmp main_loop
 
 .end_loop:
     call graceful_exit
+
+; ---------------------------------------------
+; update_window_size
+; ---------------------------------------------
+update_window_size:
+    mov rax, SYS_IOCTL
+    mov rdi, STDOUT
+    mov rsi, TIOCGWINSZ
+    mov rdx, winsize
+    syscall
+    ret
 
 ; ---------------------------------------------
 ; editor_process_keypress
@@ -117,38 +148,34 @@ editor_process_keypress:
     jl .ignore
     
     call editor_insert_char
+    mov byte [is_dirty], 1
     ret
 
 .save_trigger:
     call file_save
+    mov byte [is_dirty], 0
     ret
 
 .handle_bksp:
     call editor_backspace_char
+    mov byte [is_dirty], 1
     ret
 
 .handle_enter:
     mov byte [input_char], 10
     call editor_insert_char
+    mov byte [is_dirty], 1
     ret
 
 .handle_escape:
-    ; Read next 2 bytes into seq_buf
     mov rax, SYS_READ
     mov rdi, STDIN
     mov rsi, seq_buf
     mov rdx, 2
     syscall
-    
-    ; Check seq_buf[0] == '['
     cmp byte [seq_buf], '['
     jne .ignore
-    
     mov al, [seq_buf + 1]
-    cmp al, 'A' ; Up
-    je .arrow_up
-    cmp al, 'B' ; Down
-    je .arrow_down
     cmp al, 'C' ; Right
     je .arrow_right
     cmp al, 'D' ; Left
@@ -160,31 +187,12 @@ editor_process_keypress:
     je .ret
     dec qword [cursor_idx]
     ret
-    
 .arrow_right:
     mov rbx, [file_len]
     cmp [cursor_idx], rbx
     jge .ret
     inc qword [cursor_idx]
     ret
-    
-.arrow_up:
-    ; Move back to previous line
-    ; Simplification: move back 80 chars or until newline
-    ; Better: scan backwards for newline
-    ; Implementation: scan backwards until newline found, then that's the end of prev line.
-    ; Then find start of that prev line?
-    ; Too complex for "simplest", let's just do -40 or similar? No that's bad.
-    ; Real logic: find current column, go to prev line, find same column.
-    
-    ; For now: Up/Down disabled or just Left/Left/Left...
-    ; Let's implement at least "Go to start of previous line"
-    ret
-
-.arrow_down:
-    ; Go to start of next line
-    ret
-
 .ret:
     ret
 .ignore:
@@ -196,42 +204,29 @@ editor_process_keypress:
 editor_insert_char:
     mov rbx, [cursor_idx]
     mov rcx, [file_len]
-    
     cmp rcx, MAX_BUF_SIZE
     jge .full
     
-    ; Shift buffer right from cursor_idx
-    ; src: file_buf + file_len - 1
-    ; dst: file_buf + file_len
-    ; len: file_len - cursor_idx
-    
     mov rsi, file_buf
     add rsi, rcx
-    dec rsi       ; point to last char
-    
+    dec rsi
     mov rdi, rsi
-    inc rdi       ; point to new end
-    
+    inc rdi
     mov rdx, rcx
-    sub rdx, rbx  ; count = file_len - cursor_idx
-    
+    sub rdx, rbx
     cmp rdx, 0
     jle .insert_now
-    
-    std           ; copy backwards
+    std
     mov rcx, rdx
     rep movsb
     cld
-    
 .insert_now:
     mov al, [input_char]
     lea rdi, [file_buf]
     add rdi, [cursor_idx]
     mov [rdi], al
-    
     inc qword [file_len]
     inc qword [cursor_idx]
-    
 .full:
     ret
 
@@ -242,28 +237,19 @@ editor_backspace_char:
     mov rbx, [cursor_idx]
     cmp rbx, 0
     je .done
-    
-    ; remove char at cursor_idx - 1
     dec qword [cursor_idx]
     dec qword [file_len]
-    
     mov rbx, [cursor_idx]
     mov rcx, [file_len]
-    sub rcx, rbx ; count to move
-    
+    sub rcx, rbx
     cmp rcx, 0
     jle .done
-    
-    ; shift left
     lea rdi, [file_buf]
-    add rdi, rbx ; dest = cursor_idx (new)
-    
+    add rdi, rbx
     lea rsi, [file_buf]
     add rsi, rbx
-    inc rsi      ; src = cursor_idx + 1 (old)
-    
+    inc rsi
     rep movsb
-    
 .done:
     ret
 
@@ -271,8 +257,6 @@ editor_backspace_char:
 ; editor_refresh_screen
 ; ---------------------------------------------
 editor_refresh_screen:
-    ; Hide cursor? Optional
-    
     ; 1. Clear screen
     mov rax, SYS_WRITE
     mov rdi, STDOUT
@@ -281,65 +265,42 @@ editor_refresh_screen:
     syscall
     
     ; 2. Render content
-    ; Convert newlines to \r\n on the fly?
-    ; Termios OPOST is off, so \n is just line feed (cursor down), no CR.
-    ; We need \r\n for raw mode.
-    ; Simple way: just write the buffer as is, but we might see "staircase" effect.
-    ; OR, we can rely on ICRNL/ONLCR?
-    ; In raw mode, output processing is off.
-    ; So we should manually iterate and output \r before \n.
-    ; Or, just re-enable OPOST + ONLCR flag in termios?
-    ; That's easier! 
-    ; But raw mode usually means disabling all processing.
-    ; Let's re-enable OPOST in enable_raw_mode? Or just handle it.
-    ; Handling it in asm render loop: iterate buffer, if \n, print \r\n.
-    
-    ; Let's just output buffer for now, assume user files have \n.
-    ; Staircase effect will happen.
-    ; Fix: Loop and print.
-    
     mov rsi, file_buf
     mov rcx, [file_len]
-    xor rbx, rbx ; counter
-    
+    xor rbx, rbx 
 .render_loop:
     cmp rbx, rcx
     jge .render_done
-    
     mov al, [rsi + rbx]
-    
-    ; Save loop state across syscalls
     push rcx
     push rsi
     push rbx
-    
     cmp al, 10
     je .handle_newline
-    
-    ; Just a regular char
     call .print_one
     jmp .iteration_done
-    
 .handle_newline:
     mov al, 13
     call .print_one
     mov al, 10
     call .print_one
-    
 .iteration_done:
     pop rbx
     pop rsi
     pop rcx
     inc rbx
     jmp .render_loop
-    
 .render_done:
-    ; 3. Position Cursor
-    call cursor_position_update
+
+    ; 3. Draw Status Bar
+    call editor_draw_status_bar
+    
+    ; 4. Reset Cursor to writing position
+    call cursor_position_update ; this also updates actual_row/col
     ret
 
 .print_one:
-    mov [input_char], al ; re-use input_char as temp buffer
+    mov [input_char], al
     mov rax, SYS_WRITE
     mov rdi, STDOUT
     lea rsi, [input_char]
@@ -347,75 +308,138 @@ editor_refresh_screen:
     syscall
     ret
 
-
-; Calculate cursor position based on cursor_idx
-cursor_position_update:
-    ; We need to count lines and cols up to cursor_idx
-    xor rcx, rcx ; current index
-    xor r8, r8   ; row (0-based)
-    xor r9, r9   ; col (0-based)
+; ---------------------------------------------
+; editor_draw_status_bar
+; ---------------------------------------------
+editor_draw_status_bar:
+    ; Position cursor at row ws_row-1, col 1
+    movzx rax, word [winsize + 0] ; ws_row
+    dec rax
+    mov r8, rax ; row
+    mov r9, 1   ; col
+    call set_cursor_pos
     
+    ; Invert colors
+    mov rax, SYS_WRITE
+    mov rdi, STDOUT
+    mov rsi, status_bar_fmt
+    mov rdx, 5
+    syscall
+    
+    ; Print Filename
+    mov rsi, [file_path]
+    test rsi, rsi
+    jnz .print_filename
+    mov rsi, label_untitled
+.print_filename:
+    call print_string
+    
+    ; Print modification status
+    cmp byte [is_dirty], 1
+    jne .not_modified
+    mov rsi, label_modified
+    call print_string
+    jmp .print_line_info
+.not_modified:
+    ; maybe print [Saved]?
+.print_line_info:
+    mov rsi, label_line
+    call print_string
+    
+    ; Calculate current line number for display
+    call cursor_position_update ; ensure actual_row is fresh
+    mov rax, [actual_row]
+    inc rax
+    lea rdi, [render_buf]
+    call int_to_ascii
+    mov byte [rdi], 0
+    lea rsi, [render_buf]
+    call print_string
+
+    ; Fill rest of line with spaces to maintain inverted background?
+    ; For now just reset
+    mov rax, SYS_WRITE
+    mov rdi, STDOUT
+    mov rsi, status_reset
+    mov rdx, 4
+    syscall
+    
+    ; Position cursor at row ws_row, col 1 for Legend
+    movzx rax, word [winsize + 0]
+    mov r8, rax
+    mov r9, 1
+    call set_cursor_pos
+    
+    mov rsi, legend_msg
+    call print_string
+    ret
+
+; Helper: Print null-terminated string in RSI
+print_string:
+    push rsi
+    xor rdx, rdx
+.count:
+    cmp byte [rsi + rdx], 0
+    je .done
+    inc rdx
+    jmp .count
+.done:
+    mov rax, SYS_WRITE
+    mov rdi, STDOUT
+    ; rsi already set
+    ; rdx now has length
+    syscall
+    pop rsi
+    ret
+
+; Helper: Set cursor pos to row R8, col R9
+set_cursor_pos:
+    lea rdi, [render_buf]
+    mov byte [rdi], 27
+    mov byte [rdi+1], '['
+    add rdi, 2
+    mov rax, r8
+    call int_to_ascii
+    mov byte [rdi], ';'
+    inc rdi
+    mov rax, r9
+    call int_to_ascii
+    mov byte [rdi], 'H'
+    inc rdi
+    mov byte [rdi], 0
+    lea rsi, [render_buf]
+    call print_string
+    ret
+
+; ---------------------------------------------
+; cursor_position_update
+; ---------------------------------------------
+cursor_position_update:
+    xor rcx, rcx
+    xor r8, r8   ; row
+    xor r9, r9   ; col
     mov rbx, [cursor_idx]
     mov rsi, file_buf
-    
 .count_loop:
     cmp rcx, rbx
     jge .calc_done
-    
     mov al, [rsi + rcx]
     cmp al, 10
     je .is_newline
     inc r9
     jmp .next_char
-    
 .is_newline:
     inc r8
     xor r9, r9
-    
 .next_char:
     inc rcx
     jmp .count_loop
-
 .calc_done:
-    ; row = r8 + 1, col = r9 + 1
+    mov [actual_row], r8
+    mov [actual_col], r9
     inc r8
     inc r9
-    
-    ; Construct "\x1b[row;colH"
-    ; helper to convert int to ascii
-    ; We'll use a local buffer
-    
-    ; Just hardcode format logic for simplicity?
-    ; buffer: 27, '[', r8..., ';', r9..., 'H'
-    
-    lea rdi, [render_buf]
-    mov byte [rdi], 27
-    mov byte [rdi+1], '['
-    add rdi, 2
-    
-    mov rax, r8
-    call int_to_ascii
-    
-    mov byte [rdi], ';'
-    inc rdi
-    
-    mov rax, r9
-    call int_to_ascii
-    
-    mov byte [rdi], 'H'
-    inc rdi
-    mov byte [rdi], 0
-    
-    ; Print it
-    lea rsi, [render_buf]
-    mov rdx, rdi
-    sub rdx, rsi ; length
-    
-    mov rax, SYS_WRITE
-    mov rdi, STDOUT
-    ; rsi set
-    ; rdx set
-    syscall
+    call set_cursor_pos
     ret
 
 ; Convert RAX to ASCII at RDI, update RDI to end
@@ -423,10 +447,8 @@ int_to_ascii:
     push rbx
     push rcx
     push rdx
-    
     mov rbx, 10
-    xor rcx, rcx ; digit count
-    
+    xor rcx, rcx 
 .div_loop:
     xor rdx, rdx
     div rbx
@@ -434,22 +456,20 @@ int_to_ascii:
     inc rcx
     test rax, rax
     jnz .div_loop
-    
 .store_loop:
     pop rax
     add al, '0'
     mov [rdi], al
     inc rdi
     loop .store_loop
-    
     pop rdx
     pop rcx
     pop rbx
     ret
 
-; ... (Include file_save, file_open, raw mode utils from previous step)
-; Re-including them briefly for completeness in overwrite
-
+; ---------------------------------------------
+; Utils
+; ---------------------------------------------
 graceful_exit:
     call disable_raw_mode
     mov rax, SYS_WRITE
@@ -470,19 +490,15 @@ file_open:
     cmp rax, 0
     jl .open_failed
     mov rdi, rax
+    mov r8, rax ; save fd
     mov rax, SYS_READ
     mov rsi, file_buf
     mov rdx, MAX_BUF_SIZE
     syscall
     mov [file_len], rax
-    ; Don't close for now, or need to save FD.
-    ; Cleanliness: Close it.
-    ; SYS_CLOSE takes fd in RDI.
-    ; Wait, the FD was in RDI.
-    ; SYS_READ returns len in RAX.
-    ; RDI is PRESERVED by syscall? No.
-    ; We need to save FD.
-    ; Let's skip close for this minimal version or assume single open.
+    mov rax, SYS_CLOSE
+    mov rdi, r8
+    syscall
     ret
 .open_failed:
     mov qword [file_len], 0
@@ -490,22 +506,22 @@ file_open:
 
 file_save:
     mov rdi, [file_path]
-    cmp rdi, 0
-    je .ret
+    test rdi, rdi
+    jz .ret
     mov rax, SYS_OPEN
     mov rsi, 578 ; O_RDWR|O_CREAT|O_TRUNC
     mov rdx, 0644o
     syscall
     cmp rax, 0
     jl .ret
-    mov rbx, rax ; Save FD in RBX
+    mov r8, rax ; fd
     mov rdi, rax
     mov rax, SYS_WRITE
     mov rsi, file_buf
     mov rdx, [file_len]
     syscall
     mov rax, SYS_CLOSE
-    mov rdi, rbx
+    mov rdi, r8
     syscall
 .ret:
     ret

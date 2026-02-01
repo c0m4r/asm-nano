@@ -5,10 +5,10 @@ A lightweight, pure assembly text editor for Linux x86_64.
 ## Features
 - **No Dependencies**: Uses direct Linux system calls (no libc).
 - **Basic Editing**: Insert, Backspace, Left/Right Navigation.
-- **File I/O**: Open existing files or create new ones.
-- **Save**: `CTRL+S`
-- **Quit**: `CTRL+Q`
-- **Minimalist**: ~2KB binary size.
+- **Status Bar**: Shows filename, modification status, and current line number.
+- **Shortcuts Legend**: Displays keybindings at the bottom of the screen.
+- **Dynamic Terminal Size**: Automatically adapts to terminal window dimensions.
+- **Minimalist**: ~3KB binary size.
 
 ## Build and Run
 
